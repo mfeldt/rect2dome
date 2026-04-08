@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rect2dome"
+version = "0.1.0"
+description = "Convert rectangular/equirectangular images and videos to dome master format"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+keywords = ["panorama", "domemaster", "fisheye", "panotools", "hugin", "ffmpeg"]
+
+[project.scripts]
+rect2dome = "rect2dome:main"
+
+[tool.setuptools]
+py-modules = ["rect2dome"]
