@@ -337,7 +337,7 @@ def reproject_rectilinear_to_fisheye(
     # y_cam points "down" in the image (away from zenith).
     y_cam = -up_perp / up_perp_norm
 
-    # x_cam = y_cam × z_cam  (right-hand rule: x × y = z  →  x = y × z)
+    # x_cam = y_cam × z_cam  (completing the right-handed frame: x × y = z  →  x = y × z)
     x_cam = np.cross(y_cam, z_cam)
 
     # ------------------------------------------------------------------
