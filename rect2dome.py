@@ -25,6 +25,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 __version__ = "0.1.0"
 
 logger = logging.getLogger(__name__)
@@ -242,6 +245,154 @@ def run_nona(pto_path: Path, output_prefix: Path) -> Path:
             f"nona did not produce the expected output file: {nona_output}"
         )
     return nona_output
+
+
+# ---------------------------------------------------------------------------
+# OpenCV-based projection (nona-free alternative)
+# ---------------------------------------------------------------------------
+
+
+def reproject_rectilinear_to_fisheye(
+    src_img: "np.ndarray",
+    output_size: int,
+    lat_deg: float,
+    lon_deg: float,
+    hfov_deg: float,
+    fisheye_fov_deg: float = 180.0,
+) -> "np.ndarray":
+    """Reproject a rectilinear image onto a square equidistant fisheye image.
+
+    The function builds a pixel-coordinate map from every output fisheye pixel
+    back to the corresponding source pixel and then calls :func:`cv2.remap` for
+    efficient bilinear resampling.  Pixels that fall outside the rectilinear
+    image (or behind the camera) are set to black.
+
+    **Coordinate conventions**
+
+    The fisheye coordinate frame is defined so that:
+
+    * The centre of the fisheye image is the zenith / pole (θ = 0).
+    * Moving right across the image corresponds to *longitude* = 0 (world +x).
+    * Moving down across the image corresponds to *longitude* = 90 ° (world +y).
+    * Latitude = 90 ° is the zenith; latitude = 0 ° is the horizon.
+
+    The "up" direction in the rectilinear image is always oriented toward the
+    fisheye zenith (the component of the zenith direction perpendicular to the
+    optical axis).  When the optical axis already points at the zenith, the
+    positive x-axis of the fisheye image is used as the "up" reference instead.
+
+    :param src_img: Source rectilinear image as a NumPy array (H × W or H × W × C).
+    :param output_size: Side length of the square output image in pixels.
+    :param lat_deg: Latitude (degrees) of the point on the unit sphere where the
+        rectilinear camera's optical axis is attached.  90 ° = zenith (centre of
+        fisheye), 0 ° = horizon (edge of a 180 ° fisheye).
+    :param lon_deg: Longitude (degrees) of the optical axis attachment point.
+        0 ° = right of the fisheye image; 90 ° = bottom of the fisheye image.
+    :param hfov_deg: Horizontal field of view of the rectilinear source image in
+        degrees.
+    :param fisheye_fov_deg: Total angular field of view of the output equidistant
+        fisheye image in degrees.  Defaults to 180 °.
+    :returns: Output fisheye image as a NumPy array of the same dtype as *src_img*
+        with shape (*output_size*, *output_size*) or
+        (*output_size*, *output_size*, C).
+    """
+    src_h, src_w = src_img.shape[:2]
+    lat = np.radians(lat_deg)
+    lon = np.radians(lon_deg)
+    hfov = np.radians(hfov_deg)
+    fisheye_max_angle = np.radians(fisheye_fov_deg / 2.0)
+
+    # Focal length of the rectilinear source image (in pixels).
+    # tan(hfov/2) = (src_w/2) / focal → focal = (src_w/2) / tan(hfov/2)
+    focal_rect = (src_w / 2.0) / np.tan(hfov / 2.0)
+
+    # Fisheye output image geometry.
+    cx = output_size / 2.0
+    cy = output_size / 2.0
+    R = output_size / 2.0  # radius of the full fisheye circle
+
+    # ------------------------------------------------------------------
+    # Build the camera coordinate frame for the rectilinear projection.
+    # Axes: x_cam = right in image, y_cam = down in image, z_cam = forward.
+    # ------------------------------------------------------------------
+
+    # Optical axis direction in world space (z_cam).
+    z_cam = np.array([
+        np.cos(lat) * np.cos(lon),
+        np.cos(lat) * np.sin(lon),
+        np.sin(lat),
+    ])
+
+    # "Up" in the image corresponds to -y_cam, which we orient toward the
+    # fisheye zenith (world +z) projected perpendicular to the optical axis.
+    world_up = np.array([0.0, 0.0, 1.0])
+    up_perp = world_up - np.dot(world_up, z_cam) * z_cam
+    up_perp_norm = np.linalg.norm(up_perp)
+    if up_perp_norm < 1e-9:
+        # Optical axis is parallel to world_up; fall back to world +x as reference.
+        ref = np.array([1.0, 0.0, 0.0])
+        up_perp = ref - np.dot(ref, z_cam) * z_cam
+        up_perp_norm = np.linalg.norm(up_perp)
+
+    # y_cam points "down" in the image (away from zenith).
+    y_cam = -up_perp / up_perp_norm
+
+    # x_cam = y_cam × z_cam  (completing the right-handed frame: x × y = z  →  x = y × z)
+    x_cam = np.cross(y_cam, z_cam)
+
+    # ------------------------------------------------------------------
+    # Build the inverse map: output (fisheye) pixel → source (rect) pixel.
+    # ------------------------------------------------------------------
+
+    # Pixel grid for the output image (row = y, col = x).
+    py_out, px_out = np.mgrid[0:output_size, 0:output_size].astype(np.float64)
+
+    # Offset from the fisheye image centre.
+    dx = px_out - cx
+    dy = py_out - cy
+    r = np.sqrt(dx * dx + dy * dy)
+
+    # Equidistant fisheye: zenith angle θ is proportional to radius.
+    theta = (r / R) * fisheye_max_angle
+
+    # Azimuth angle; handle the degenerate case r == 0 (exactly the centre pixel).
+    with np.errstate(invalid="ignore"):
+        cos_phi = np.where(r > 0.0, dx / r, 1.0)
+        sin_phi = np.where(r > 0.0, dy / r, 0.0)
+
+    sin_theta = np.sin(theta)
+    cos_theta = np.cos(theta)
+
+    # 3-D direction vector in world space.
+    d_x = sin_theta * cos_phi
+    d_y = sin_theta * sin_phi
+    d_z = cos_theta
+
+    # Project direction into the rectilinear camera frame.
+    d_cam_x = x_cam[0] * d_x + x_cam[1] * d_y + x_cam[2] * d_z
+    d_cam_y = y_cam[0] * d_x + y_cam[1] * d_y + y_cam[2] * d_z
+    d_cam_z = z_cam[0] * d_x + z_cam[1] * d_y + z_cam[2] * d_z
+
+    # Perspective projection onto the rectilinear image plane (z_cam == 1).
+    # Points behind the camera (d_cam_z <= 0) are invalid.
+    valid = d_cam_z > 0.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        src_x = np.where(valid, focal_rect * d_cam_x / d_cam_z + src_w / 2.0, -1.0)
+        src_y = np.where(valid, focal_rect * d_cam_y / d_cam_z + src_h / 2.0, -1.0)
+
+    # Mark coordinates outside the source image as invalid (remap will fill with 0).
+    valid &= (src_x >= 0.0) & (src_x < src_w) & (src_y >= 0.0) & (src_y < src_h)
+    map_x = np.where(valid, src_x, -1.0).astype(np.float32)
+    map_y = np.where(valid, src_y, -1.0).astype(np.float32)
+
+    return cv2.remap(
+        src_img,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
 
 
 # ---------------------------------------------------------------------------
