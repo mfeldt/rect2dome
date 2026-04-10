@@ -575,3 +575,58 @@ class TestReprojectRectilinearToFisheye:
         reproject_rectilinear_to_fisheye(
             src, 128, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
         )  # should not raise
+
+    # ------------------------------------------------------------------
+    # upright mode
+    # ------------------------------------------------------------------
+
+    def test_upright_output_shape(self):
+        """upright=True must not change the output shape."""
+        src = self._solid_image()
+        out = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=0.0, lon_deg=0.0, hfov_deg=90.0, upright=True
+        )
+        assert out.shape == (256, 256, 3)
+
+    def test_upright_differs_from_tangential(self):
+        """upright=True and upright=False should produce different images for the
+        same lat/lon, because lat_deg has a different geometric meaning."""
+        src = self._solid_image(value=200)
+        out_tangential = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=20.0, lon_deg=0.0, hfov_deg=90.0, upright=False
+        )
+        out_upright = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=20.0, lon_deg=0.0, hfov_deg=90.0, upright=True
+        )
+        assert not np.array_equal(out_tangential, out_upright)
+
+    def test_upright_lower_boundary_matches_tangential_center(self):
+        """In upright mode, lat_deg is the lower boundary.  Therefore, calling
+        upright=True with lat_deg=L should produce the same result as
+        upright=False with lat_deg equal to L plus the vertical half-FOV."""
+        src = self._solid_image(value=180)
+        hfov_deg = 90.0
+        lat_lower = 10.0
+        src_h, src_w = src.shape[:2]
+        focal = (src_w / 2.0) / np.tan(np.radians(hfov_deg / 2.0))
+        vhalf_deg = np.degrees(np.arctan((src_h / 2.0) / focal))
+        lat_center = lat_lower + vhalf_deg
+
+        out_upright = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=lat_lower, lon_deg=45.0, hfov_deg=hfov_deg, upright=True
+        )
+        out_tangential = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=lat_center, lon_deg=45.0, hfov_deg=hfov_deg, upright=False
+        )
+        np.testing.assert_array_equal(out_upright, out_tangential)
+
+    def test_upright_false_is_default(self):
+        """upright defaults to False; explicit False should match the default."""
+        src = self._solid_image(value=150)
+        out_default = reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=30.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        out_explicit = reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=30.0, lon_deg=0.0, hfov_deg=60.0, upright=False
+        )
+        np.testing.assert_array_equal(out_default, out_explicit)
