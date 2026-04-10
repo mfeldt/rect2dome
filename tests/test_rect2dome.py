@@ -10,6 +10,7 @@ import textwrap
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pytest
 
 import rect2dome
@@ -29,6 +30,7 @@ from rect2dome import (
     main,
     process_image,
     process_video,
+    reproject_rectilinear_to_fisheye,
     run_nona,
 )
 
@@ -454,3 +456,122 @@ class TestMain:
             rc = main([str(src), str(dst)])
 
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# reproject_rectilinear_to_fisheye
+# ---------------------------------------------------------------------------
+
+
+class TestReprojectRectilinearToFisheye:
+    """Tests for the OpenCV-based rectilinear → equidistant fisheye reprojection."""
+
+    def _solid_image(self, height=480, width=640, channels=3, value=200):
+        """Return a solid-colour uint8 image."""
+        img = np.full((height, width, channels), value, dtype=np.uint8)
+        return img
+
+    # ------------------------------------------------------------------
+    # Output shape and dtype
+    # ------------------------------------------------------------------
+
+    def test_output_shape_square(self):
+        src = self._solid_image()
+        out = reproject_rectilinear_to_fisheye(src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=90.0)
+        assert out.shape == (256, 256, 3)
+
+    def test_output_dtype_preserved(self):
+        src = self._solid_image().astype(np.float32)
+        out = reproject_rectilinear_to_fisheye(src, 128, lat_deg=90.0, lon_deg=0.0, hfov_deg=90.0)
+        assert out.dtype == np.float32
+
+    def test_output_shape_grayscale(self):
+        src = np.full((480, 640), 128, dtype=np.uint8)
+        out = reproject_rectilinear_to_fisheye(src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=90.0)
+        assert out.shape == (256, 256)
+
+    # ------------------------------------------------------------------
+    # Pixels outside the fisheye circle should be black (no contribution
+    # from a source pointed at the zenith for a 180 ° output FOV).
+    # ------------------------------------------------------------------
+
+    def test_corners_are_black_for_small_hfov(self):
+        """Corners of the output image are outside the fisheye circle and must be 0."""
+        src = self._solid_image(value=255)
+        out = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=10.0
+        )
+        # Corners are well outside any visible region.
+        for corner in [(0, 0), (0, 255), (255, 0), (255, 255)]:
+            assert np.all(out[corner] == 0), f"corner {corner} should be black"
+
+    # ------------------------------------------------------------------
+    # Centre pixel correctness: camera pointing at zenith (lat=90°)
+    # ------------------------------------------------------------------
+
+    def test_center_pixel_is_nonzero_when_looking_at_zenith(self):
+        """When the camera points at the zenith, the fisheye centre pixel should
+        map back to the centre of the source image and thus be non-zero."""
+        src = self._solid_image(value=200)
+        out = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        centre = out[128, 128]
+        assert np.any(centre > 0), "Centre pixel should receive source colour"
+
+    # ------------------------------------------------------------------
+    # Equatorial placement (lat=0)
+    # ------------------------------------------------------------------
+
+    def test_camera_at_equator_produces_output(self):
+        """A camera placed at lat=0, lon=0 should paint the right edge of the
+        fisheye with non-zero pixels."""
+        src = self._solid_image(value=180)
+        out = reproject_rectilinear_to_fisheye(
+            src, 512, lat_deg=0.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        # The right-hand slice of the output (toward lat=0, lon=0) should
+        # contain some non-zero pixels.
+        right_strip = out[256, 400:]
+        assert np.any(right_strip > 0), "Right strip should receive source colour"
+
+    # ------------------------------------------------------------------
+    # Longitude rotation: the mapping should differ between lon=0 and lon=90°
+    # ------------------------------------------------------------------
+
+    def test_different_longitudes_give_different_results(self):
+        src = self._solid_image(value=150)
+        out0 = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=0.0, lon_deg=0.0, hfov_deg=90.0
+        )
+        out90 = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=0.0, lon_deg=90.0, hfov_deg=90.0
+        )
+        # The two outputs should have their non-black regions in different locations.
+        assert not np.array_equal(out0, out90)
+
+    # ------------------------------------------------------------------
+    # Wider FOV covers more pixels than a narrower FOV
+    # ------------------------------------------------------------------
+
+    def test_wider_hfov_covers_more_pixels(self):
+        src = self._solid_image(value=200)
+        out_narrow = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=30.0
+        )
+        out_wide = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=120.0
+        )
+        nonzero_narrow = np.count_nonzero(np.any(out_narrow > 0, axis=-1))
+        nonzero_wide = np.count_nonzero(np.any(out_wide > 0, axis=-1))
+        assert nonzero_wide > nonzero_narrow
+
+    # ------------------------------------------------------------------
+    # Zenith singularity: lat=90° should not raise
+    # ------------------------------------------------------------------
+
+    def test_no_error_at_zenith_singularity(self):
+        src = self._solid_image()
+        reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
+        )  # should not raise

@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 keywords = ["panorama", "domemaster", "fisheye", "panotools", "hugin", "ffmpeg"]
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.7",
+]
 
 [project.scripts]
 rect2dome = "rect2dome:main"
