@@ -259,6 +259,7 @@ def reproject_rectilinear_to_fisheye(
     lon_deg: float,
     hfov_deg: float,
     fisheye_fov_deg: float = 180.0,
+    upright: bool = False,
 ) -> "np.ndarray":
     """Reproject a rectilinear image onto a square equidistant fisheye image.
 
@@ -281,17 +282,35 @@ def reproject_rectilinear_to_fisheye(
     optical axis).  When the optical axis already points at the zenith, the
     positive x-axis of the fisheye image is used as the "up" reference instead.
 
+    **Placement modes**
+
+    When *upright* is ``False`` (default), the image is placed tangentially to
+    the sphere: the optical axis points directly at the point (``lat_deg``,
+    ``lon_deg``), and that point corresponds to the centre of the source image.
+
+    When *upright* is ``True``, the camera optical axis is kept strictly
+    horizontal (lat = 0) and the image is shifted vertically so that its
+    bottom row maps to the latitude given by ``lat_deg``.  This means the
+    camera never "looks up" regardless of ``lat_deg``, so the image can never
+    project across the zenith.  Horizontal lines in the source image remain
+    parallel to latitude circles and the image appears undistorted (no
+    keystone effect).
+
     :param src_img: Source rectilinear image as a NumPy array (H × W or H × W × C).
     :param output_size: Side length of the square output image in pixels.
-    :param lat_deg: Latitude (degrees) of the point on the unit sphere where the
-        rectilinear camera's optical axis is attached.  90 ° = zenith (centre of
-        fisheye), 0 ° = horizon (edge of a 180 ° fisheye).
+    :param lat_deg: In the default (tangential) mode, the latitude (degrees) of
+        the point on the unit sphere where the camera's optical axis is attached
+        (centre of the image).  In upright mode, the latitude of the **lower
+        boundary** of the reprojected image.  90 ° = zenith, 0 ° = horizon.
     :param lon_deg: Longitude (degrees) of the optical axis attachment point.
         0 ° = right of the fisheye image; 90 ° = bottom of the fisheye image.
     :param hfov_deg: Horizontal field of view of the rectilinear source image in
         degrees.
     :param fisheye_fov_deg: Total angular field of view of the output equidistant
         fisheye image in degrees.  Defaults to 180 °.
+    :param upright: When ``True``, the camera is kept vertically upright and
+        *lat_deg* defines the lower latitude boundary of the reprojected image
+        rather than its centre.  Defaults to ``False``.
     :returns: Output fisheye image as a NumPy array of the same dtype as *src_img*
         with shape (*output_size*, *output_size*) or
         (*output_size*, *output_size*, C).
@@ -305,6 +324,28 @@ def reproject_rectilinear_to_fisheye(
     # Focal length of the rectilinear source image (in pixels).
     # tan(hfov/2) = (src_w/2) / focal → focal = (src_w/2) / tan(hfov/2)
     focal_rect = (src_w / 2.0) / np.tan(hfov / 2.0)
+
+    if upright:
+        # In upright mode the camera is kept perfectly horizontal (optical
+        # axis at lat = 0).  Instead of tilting the axis, we apply a constant
+        # vertical pixel offset to the source-image lookup so that the bottom
+        # row of the source image maps to the requested lower latitude boundary.
+        #
+        # For a horizontal camera a direction at latitude φ (along the optical
+        # meridian) projects to:
+        #   src_y = focal_rect · (−tan φ) + src_h/2
+        # The bottom row (src_y = src_h) therefore sits at φ = −vhalf (below
+        # the horizon).  To shift the lower boundary to lat_deg we add:
+        #   y_shift = src_h/2 + focal_rect · tan(lat_deg)
+        # which moves that bottom row to φ = lat_deg without tilting the axis.
+        # Because z_cam stays horizontal (z component = 0), directions toward
+        # the zenith always have d_cam_z = 0 and are therefore always invalid
+        # (black), satisfying the guarantee that the image never crosses the
+        # zenith.
+        y_shift = src_h / 2.0 + focal_rect * np.tan(lat)
+        lat = 0.0
+    else:
+        y_shift = 0.0
 
     # Fisheye output image geometry.
     cx = output_size / 2.0
@@ -378,7 +419,7 @@ def reproject_rectilinear_to_fisheye(
     valid = d_cam_z > 0.0
     with np.errstate(invalid="ignore", divide="ignore"):
         src_x = np.where(valid, focal_rect * d_cam_x / d_cam_z + src_w / 2.0, -1.0)
-        src_y = np.where(valid, focal_rect * d_cam_y / d_cam_z + src_h / 2.0, -1.0)
+        src_y = np.where(valid, focal_rect * d_cam_y / d_cam_z + src_h / 2.0 + y_shift, -1.0)
 
     # Mark coordinates outside the source image as invalid (remap will fill with 0).
     valid &= (src_x >= 0.0) & (src_x < src_w) & (src_y >= 0.0) & (src_y < src_h)

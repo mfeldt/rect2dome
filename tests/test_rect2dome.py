@@ -575,3 +575,67 @@ class TestReprojectRectilinearToFisheye:
         reproject_rectilinear_to_fisheye(
             src, 128, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
         )  # should not raise
+
+    # ------------------------------------------------------------------
+    # upright mode
+    # ------------------------------------------------------------------
+
+    def test_upright_output_shape(self):
+        """upright=True must not change the output shape."""
+        src = self._solid_image()
+        out = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=0.0, lon_deg=0.0, hfov_deg=90.0, upright=True
+        )
+        assert out.shape == (256, 256, 3)
+
+    def test_upright_differs_from_tangential(self):
+        """upright=True and upright=False should produce different images for the
+        same lat/lon, because lat_deg has a different geometric meaning."""
+        src = self._solid_image(value=200)
+        out_tangential = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=20.0, lon_deg=0.0, hfov_deg=90.0, upright=False
+        )
+        out_upright = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=20.0, lon_deg=0.0, hfov_deg=90.0, upright=True
+        )
+        assert not np.array_equal(out_tangential, out_upright)
+
+    def test_upright_never_crosses_zenith(self):
+        """The zenith (fisheye centre) must always be black in upright mode.
+
+        A horizontal optical axis has d_cam_z = 0 for the zenith direction, so
+        the zenith is always outside the valid half-space regardless of lat_deg
+        or hfov_deg.  Use parameters that would have caused the old (buggy)
+        implementation to tilt the axis past the zenith.
+        """
+        src = self._solid_image(value=200)
+        # With the old code, lat_deg=45° + hfov=120° on a square image gave
+        # vhalf≈60°, pushing the optical axis to 105° — past the zenith.
+        output_size = 256
+        center = output_size // 2
+        out = reproject_rectilinear_to_fisheye(
+            src, output_size, lat_deg=45.0, lon_deg=0.0, hfov_deg=120.0, upright=True
+        )
+        assert np.all(out[center, center] == 0), "Zenith must be black for a horizontal upright camera"
+
+    def test_upright_zenith_black_for_zero_lat(self):
+        """Even with lat_deg=0, the zenith must be black because the optical axis
+        is horizontal and cannot 'see' a direction 90° above it."""
+        src = self._solid_image(value=200)
+        output_size = 256
+        center = output_size // 2
+        out = reproject_rectilinear_to_fisheye(
+            src, output_size, lat_deg=0.0, lon_deg=0.0, hfov_deg=90.0, upright=True
+        )
+        assert np.all(out[center, center] == 0), "Zenith must be black for horizontal camera"
+
+    def test_upright_false_is_default(self):
+        """upright defaults to False; explicit False should match the default."""
+        src = self._solid_image(value=150)
+        out_default = reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=30.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        out_explicit = reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=30.0, lon_deg=0.0, hfov_deg=60.0, upright=False
+        )
+        np.testing.assert_array_equal(out_default, out_explicit)
