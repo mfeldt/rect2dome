@@ -1,15 +1,14 @@
 """Tests for rect2dome.py
 
-All tests that exercise external tools (ffmpeg, nona) mock the subprocess
+All tests that exercise external tools (ffmpeg) mock the subprocess
 calls so that the test suite can run without those tools installed.
 """
 
-import shutil
 import subprocess
-import textwrap
 from pathlib import Path
 from unittest import mock
 
+import cv2
 import numpy as np
 import pytest
 
@@ -17,11 +16,8 @@ import rect2dome
 from rect2dome import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
-    PROJECTION_EQUIRECTANGULAR,
-    PROJECTION_FISHEYE_EQUIDISTANT,
     _default_output_path,
     build_parser,
-    create_pto_file,
     detect_media_type,
     encode_video,
     extract_frames,
@@ -31,7 +27,6 @@ from rect2dome import (
     process_image,
     process_video,
     reproject_rectilinear_to_fisheye,
-    run_nona,
 )
 
 
@@ -131,61 +126,6 @@ class TestGetVideoFramerate:
 
 
 # ---------------------------------------------------------------------------
-# create_pto_file
-# ---------------------------------------------------------------------------
-
-
-class TestCreatePtoFile:
-    def _make_pto(self, tmp_path, **kwargs):
-        image = tmp_path / "source.tif"
-        pto = tmp_path / "project.pto"
-        defaults = dict(
-            image_path=image,
-            pto_path=pto,
-            src_width=4096,
-            src_height=2048,
-            output_width=2048,
-            output_height=2048,
-        )
-        defaults.update(kwargs)
-        return create_pto_file(**defaults), pto
-
-    def test_creates_file(self, tmp_path):
-        _, pto = self._make_pto(tmp_path)
-        assert pto.exists()
-
-    def test_panorama_line_present(self, tmp_path):
-        _, pto = self._make_pto(tmp_path, output_projection=3, output_fov=180.0)
-        content = pto.read_text()
-        assert "p f3" in content
-        assert "w2048" in content
-        assert "h2048" in content
-        assert "v180.0" in content
-
-    def test_image_line_contains_source_path(self, tmp_path):
-        image = tmp_path / "source.tif"
-        _, pto = self._make_pto(tmp_path, image_path=image)
-        assert str(image) in pto.read_text()
-
-    def test_returns_pto_path(self, tmp_path):
-        result, pto = self._make_pto(tmp_path)
-        assert result == pto
-
-    def test_custom_projections_and_fov(self, tmp_path):
-        _, pto = self._make_pto(
-            tmp_path,
-            input_projection=0,
-            output_projection=10,
-            hfov=90.0,
-            output_fov=180.0,
-        )
-        content = pto.read_text()
-        assert "p f10" in content
-        assert "f0" in content
-        assert "90.000000" in content
-
-
-# ---------------------------------------------------------------------------
 # extract_frames
 # ---------------------------------------------------------------------------
 
@@ -232,86 +172,51 @@ class TestEncodeVideo:
 
 
 # ---------------------------------------------------------------------------
-# run_nona
-# ---------------------------------------------------------------------------
-
-
-class TestRunNona:
-    def test_calls_nona_and_returns_output_path(self, tmp_path):
-        pto = tmp_path / "project.pto"
-        pto.touch()
-        expected_output = tmp_path / "output0000.tif"
-        expected_output.touch()  # simulate nona creating the file
-
-        with mock.patch("subprocess.run") as mock_run:
-            result = run_nona(pto, tmp_path / "output")
-
-        assert result == expected_output
-        cmd = mock_run.call_args[0][0]
-        assert "nona" in cmd
-        assert str(pto) in cmd
-
-    def test_raises_if_output_missing(self, tmp_path):
-        pto = tmp_path / "project.pto"
-        pto.touch()
-
-        with mock.patch("subprocess.run"):
-            with pytest.raises(FileNotFoundError, match="nona did not produce"):
-                run_nona(pto, tmp_path / "output")
-
-
-# ---------------------------------------------------------------------------
-# process_image (integration-level, all subprocesses mocked)
+# process_image (uses real small images, no subprocess calls)
 # ---------------------------------------------------------------------------
 
 
 class TestProcessImage:
-    def _run(self, tmp_path, **kwargs):
-        src = tmp_path / "pano.tif"
-        src.touch()
+    def _make_src(self, tmp_path, suffix=".tif"):
+        """Create a small valid source image and return its path."""
+        src = tmp_path / f"source{suffix}"
+        img = np.full((8, 16, 3), 128, dtype=np.uint8)
+        cv2.imwrite(str(src), img)
+        return src
+
+    def _run(self, tmp_path, output_size=32, **kwargs):
+        src = self._make_src(tmp_path)
         dst = tmp_path / "dome.tif"
-
-        # Sequence of subprocess.run calls:
-        #   1. get_image_dimensions (ffprobe)
-        #   2. nona
-        dim_result = mock.MagicMock()
-        dim_result.stdout = "4096,2048\n"
-        nona_result = mock.MagicMock()
-
-        work_dir = tmp_path / "work"
-        work_dir.mkdir()
-
-        def fake_run(cmd, **kw):
-            if "nona" in cmd:
-                # Simulate nona creating its output
-                prefix = cmd[cmd.index("-o") + 1]
-                (Path(prefix + "0000.tif")).touch()
-                return nona_result
-            return dim_result
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            process_image(
-                input_path=src,
-                output_path=dst,
-                work_dir=work_dir,
-                **kwargs,
-            )
-
+        process_image(input_path=src, output_path=dst, output_size=output_size, **kwargs)
         assert dst.exists()
+        return dst
 
     def test_basic(self, tmp_path):
         self._run(tmp_path)
 
     def test_custom_output_size(self, tmp_path):
-        self._run(tmp_path, output_size=4096)
+        dst = self._run(tmp_path, output_size=64)
+        out = cv2.imread(str(dst), cv2.IMREAD_UNCHANGED)
+        assert out.shape == (64, 64, 3)
+
+    def test_raises_for_unreadable_image(self, tmp_path):
+        src = tmp_path / "empty.tif"
+        src.touch()  # zero-byte file → cv2.imread returns None
+        with pytest.raises(FileNotFoundError, match="Failed to read image"):
+            process_image(input_path=src, output_path=tmp_path / "out.tif")
 
 
 # ---------------------------------------------------------------------------
-# process_video (integration-level, all subprocesses mocked)
+# process_video (integration-level, ffmpeg mocked)
 # ---------------------------------------------------------------------------
 
 
 class TestProcessVideo:
+    def _make_frame(self, path: Path) -> None:
+        """Write a minimal valid TIFF frame to *path*."""
+        img = np.full((8, 16, 3), 64, dtype=np.uint8)
+        cv2.imwrite(str(path), img)
+
     def test_basic(self, tmp_path):
         src = tmp_path / "clip.mp4"
         src.touch()
@@ -323,30 +228,18 @@ class TestProcessVideo:
 
         fps_result = mock.MagicMock()
         fps_result.stdout = "25\n"
-        dim_result = mock.MagicMock()
-        dim_result.stdout = "3840,2160\n"
-        nona_result = mock.MagicMock()
         ffmpeg_extract_result = mock.MagicMock()
         ffmpeg_encode_result = mock.MagicMock()
 
-        call_count = {"n": 0}
-
         def fake_run(cmd, **kw):
-            call_count["n"] += 1
             if "ffprobe" in cmd and "r_frame_rate" in cmd:
                 return fps_result
-            if "ffprobe" in cmd and "width" in cmd:
-                return dim_result
             if "ffmpeg" in cmd and "-framerate" not in cmd:
-                # Frame extraction: create fake frames
+                # Frame extraction: create real (readable) fake frames
                 frames_dir.mkdir(parents=True, exist_ok=True)
-                (frames_dir / "frame_000001.tif").touch()
-                (frames_dir / "frame_000002.tif").touch()
+                self._make_frame(frames_dir / "frame_000001.tif")
+                self._make_frame(frames_dir / "frame_000002.tif")
                 return ffmpeg_extract_result
-            if "nona" in cmd:
-                prefix = cmd[cmd.index("-o") + 1]
-                (Path(prefix + "0000.tif")).touch()
-                return nona_result
             if "ffmpeg" in cmd and "-framerate" in cmd:
                 return ffmpeg_encode_result
             return mock.MagicMock()
@@ -356,6 +249,7 @@ class TestProcessVideo:
                 input_path=src,
                 output_path=dst,
                 work_dir=work_dir,
+                output_size=16,
             )
 
 
@@ -383,10 +277,11 @@ class TestBuildParser:
         parser = build_parser()
         args = parser.parse_args(["input.mp4"])
         assert args.output_size == 2048
-        assert args.hfov == 360.0
+        assert args.lat == 90.0
+        assert args.lon == 0.0
+        assert args.hfov == 90.0
         assert args.output_fov == 180.0
-        assert args.input_projection == PROJECTION_EQUIRECTANGULAR
-        assert args.output_projection == PROJECTION_FISHEYE_EQUIDISTANT
+        assert not args.upright
         assert not args.keep_frames
         assert not args.verbose
 
@@ -426,34 +321,21 @@ class TestMain:
 
     def test_image_processing(self, tmp_path):
         src = tmp_path / "pano.jpg"
-        src.touch()
+        img = np.full((8, 16, 3), 100, dtype=np.uint8)
+        cv2.imwrite(str(src), img)
         dst = tmp_path / "pano_dome.jpg"
 
-        dim_result = mock.MagicMock()
-        dim_result.stdout = "3600,1800\n"
-
-        def fake_run(cmd, **kw):
-            if "nona" in cmd:
-                prefix = cmd[cmd.index("-o") + 1]
-                (Path(prefix + "0000.tif")).touch()
-            return dim_result
-
-        with mock.patch("subprocess.run", side_effect=fake_run):
-            rc = main([str(src), str(dst)])
+        rc = main([str(src), str(dst), "--output-size", "16"])
 
         assert rc == 0
         assert dst.exists()
 
-    def test_subprocess_error_returns_1(self, tmp_path):
+    def test_cv2_error_returns_1(self, tmp_path):
         src = tmp_path / "pano.jpg"
-        src.touch()
+        src.touch()  # zero-byte → cv2.imread returns None → FileNotFoundError
         dst = tmp_path / "pano_dome.jpg"
 
-        with mock.patch(
-            "subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "ffprobe"),
-        ):
-            rc = main([str(src), str(dst)])
+        rc = main([str(src), str(dst)])
 
         assert rc == 1
 
@@ -524,16 +406,16 @@ class TestReprojectRectilinearToFisheye:
     # ------------------------------------------------------------------
 
     def test_camera_at_equator_produces_output(self):
-        """A camera placed at lat=0, lon=0 should paint the right edge of the
-        fisheye with non-zero pixels."""
+        """A camera placed at lat=0, lon=0 should paint the bottom edge of the
+        fisheye with non-zero pixels (lon=0 now points downward)."""
         src = self._solid_image(value=180)
         out = reproject_rectilinear_to_fisheye(
             src, 512, lat_deg=0.0, lon_deg=0.0, hfov_deg=60.0
         )
-        # The right-hand slice of the output (toward lat=0, lon=0) should
+        # The bottom slice of the output (toward lat=0, lon=0) should
         # contain some non-zero pixels.
-        right_strip = out[256, 400:]
-        assert np.any(right_strip > 0), "Right strip should receive source colour"
+        bottom_strip = out[400:, 256]
+        assert np.any(bottom_strip > 0), "Bottom strip should receive source colour"
 
     # ------------------------------------------------------------------
     # Longitude rotation: the mapping should differ between lon=0 and lon=90°
