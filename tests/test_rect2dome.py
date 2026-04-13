@@ -330,7 +330,7 @@ class TestMain:
         assert rc == 0
         assert dst.exists()
 
-    def test_cv2_error_returns_1(self, tmp_path):
+    def test_unreadable_image_returns_1(self, tmp_path):
         src = tmp_path / "pano.jpg"
         src.touch()  # zero-byte → cv2.imread returns None → FileNotFoundError
         dst = tmp_path / "pano_dome.jpg"

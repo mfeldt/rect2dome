@@ -279,6 +279,7 @@ def reproject_rectilinear_to_fisheye(
     # ------------------------------------------------------------------
 
     # Optical axis direction in world space (z_cam).
+    # lon=0 corresponds to world +y (downward in the fisheye image); lon=90° to world +x (rightward).
     z_cam = np.array([
         np.cos(lat) * np.sin(lon),
         np.cos(lat) * np.cos(lon),
@@ -416,8 +417,9 @@ def process_video(
 
     Frames are extracted with ``ffmpeg``, each frame is reprojected via
     :func:`reproject_rectilinear_to_fisheye`, and the results are re-encoded
-    into *output_path*.  Processing a single image is a special case of this
-    pipeline without the extraction and re-encoding steps.
+    into *output_path*.  Processing a single image uses the same reprojection
+    logic via :func:`process_image`, just without the extraction and encoding
+    steps.
 
     A temporary directory is used when *work_dir* is ``None``.  The caller is
     responsible for cleaning up an explicitly supplied *work_dir*.
