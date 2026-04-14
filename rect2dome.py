@@ -169,6 +169,131 @@ def encode_video(
 
 
 # ---------------------------------------------------------------------------
+# Border helper
+# ---------------------------------------------------------------------------
+
+
+def add_border(img: "np.ndarray", border_size: int, border_color: str = "ffffff") -> "np.ndarray":
+    """Add a solid-colour border around an image.
+
+    The image is extended on all four sides by *border_size* pixels.  The
+    border colour is specified as a 6-digit hex string (e.g. ``"ffffff"`` for
+    white).  An optional leading ``#`` is stripped.
+
+    :param img: Source image as a NumPy array.
+    :param border_size: Width of the border in pixels on each side.  Zero or
+        negative values return the original image unchanged.
+    :param border_color: Hex colour string for the border (e.g. ``"ffffff"``).
+    :returns: Image with the border added, or the original image when
+        *border_size* <= 0.
+    """
+    if border_size <= 0:
+        return img
+    hex_color = border_color.lstrip("#")
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    if img.ndim == 3:
+        color: int | tuple = (b, g, r, 255) if img.shape[2] == 4 else (b, g, r)
+    else:
+        color = int(0.299 * r + 0.587 * g + 0.114 * b)
+    return cv2.copyMakeBorder(
+        img,
+        border_size, border_size, border_size, border_size,
+        cv2.BORDER_CONSTANT,
+        value=color,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Keyframe helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_keyframe_spec(spec: str) -> dict:
+    """Parse a keyframe specification string of the form ``K:f,l,ival,eval,T``.
+
+    The fields are:
+
+    * **K** – literal letter ``"K"`` marking this as a keyframe spec.
+    * **f** – first frame of the keying sequence (0-based int).
+    * **l** – last frame of the keying sequence (0-based int; negative values
+      are resolved relative to the total frame count, e.g. ``-1`` = last
+      frame).
+    * **ival** – parameter value before (and at) frame *f*.
+    * **eval** – parameter value at (and after) frame *l*.
+    * **T** – interpolation type: ``"L"`` for linear, ``"S"`` for sinusoidal
+      ease-in/ease-out.
+
+    :param spec: Keyframe spec string.
+    :returns: Dict with keys ``f``, ``l``, ``ival``, ``eval``, ``interp``.
+    :raises ValueError: If the string is malformed.
+    """
+    if not spec.startswith("K:"):
+        raise ValueError(f"Keyframe spec must start with 'K:': {spec!r}")
+    parts = spec[2:].split(",", 4)
+    if len(parts) != 5:
+        raise ValueError(
+            f"Keyframe spec must have exactly 5 comma-separated fields "
+            f"(f,l,ival,eval,T): {spec!r}"
+        )
+    f_str, l_str, ival_str, eval_str, interp = parts
+    interp = interp.strip()
+    if interp not in ("L", "S"):
+        raise ValueError(
+            f"Interpolation type must be 'L' (linear) or 'S' (sinusoidal), "
+            f"got {interp!r}: {spec!r}"
+        )
+    return {
+        "f": int(f_str),
+        "l": int(l_str),
+        "ival": float(ival_str),
+        "eval": float(eval_str),
+        "interp": interp,
+    }
+
+
+def resolve_keyframable(param: "float | str", frame_idx: int, total_frames: int) -> float:
+    """Return the numeric value of a potentially keyframed parameter at *frame_idx*.
+
+    When *param* is already a :class:`float` (or :class:`int`), it is returned
+    unchanged.  When *param* is a keyframe spec string (``"K:..."``), the
+    value is interpolated according to the spec and the current frame index.
+
+    :param param: Either a numeric value or a keyframe spec string.
+    :param frame_idx: Zero-based index of the current frame.
+    :param total_frames: Total number of frames (used to resolve negative ``l``
+        values, e.g. ``-1`` becomes ``total_frames - 1``).
+    :returns: Resolved float value.
+    """
+    if not isinstance(param, str):
+        return float(param)
+    spec = parse_keyframe_spec(param)
+    f = spec["f"]
+    l = spec["l"]
+    ival: float = spec["ival"]
+    eval_: float = spec["eval"]
+    interp: str = spec["interp"]
+
+    if l < 0:
+        l = total_frames + l
+
+    if frame_idx < f:
+        return ival
+    if frame_idx > l:
+        return eval_
+    if l <= f:
+        # Degenerate or zero-length range: return ival at the boundary.
+        return ival
+    t = (frame_idx - f) / float(l - f)
+    if interp == "L":
+        return ival + t * (eval_ - ival)
+    # interp == "S": sinusoidal ease-in/ease-out
+    s = 0.5 * (1.0 - np.cos(np.pi * t))
+    return ival + s * (eval_ - ival)
+
+
+# ---------------------------------------------------------------------------
 # OpenCV-based projection
 # ---------------------------------------------------------------------------
 
@@ -236,6 +361,20 @@ def reproject_rectilinear_to_fisheye(
         with shape (*output_size*, *output_size*) or
         (*output_size*, *output_size*, C).
     """
+    # Ensure the source image has an alpha channel so that pixels outside the
+    # valid mapping region become fully transparent in the output.  Only 3-channel
+    # (BGR) images are upgraded; grayscale and already-4-channel images are left
+    # unchanged.
+    if src_img.ndim == 3 and src_img.shape[2] == 3:
+        if src_img.dtype.kind in ("u", "i"):
+            alpha_val = np.iinfo(src_img.dtype).max
+        else:
+            alpha_val = 1.0
+        alpha_ch = np.full(
+            (*src_img.shape[:2], 1), alpha_val, dtype=src_img.dtype
+        )
+        src_img = np.concatenate([src_img, alpha_ch], axis=2)
+
     src_h, src_w = src_img.shape[:2]
     lat = np.radians(lat_deg)
     lon = np.radians(lon_deg)
@@ -366,12 +505,14 @@ def reproject_rectilinear_to_fisheye(
 def process_image(
     input_path: Path,
     output_path: Path,
-    output_size: int = 2048,
-    lat_deg: float = 90.0,
-    lon_deg: float = 0.0,
-    hfov_deg: float = 90.0,
+    output_size: int = 4096,
+    lat_deg: "float | str" = 90.0,
+    lon_deg: "float | str" = 0.0,
+    hfov_deg: "float | str" = 90.0,
     fisheye_fov_deg: float = 180.0,
     upright: bool = False,
+    border_size: int = 0,
+    border_color: str = "ffffff",
 ) -> None:
     """Convert a single rectilinear image to an equidistant fisheye dome master.
 
@@ -383,20 +524,34 @@ def process_image(
     :param output_path: Destination file (TIFF recommended for lossless output).
     :param output_size: Side length of the (square) output image in pixels.
     :param lat_deg: Latitude of the camera's optical axis (90 ° = zenith).
+        Can be a float or a keyframe spec string ``"K:f,l,ival,eval,T"``.
     :param lon_deg: Longitude of the camera's optical axis (0 ° = bottom).
+        Can be a float or a keyframe spec string.
     :param hfov_deg: Horizontal field of view of the source image in degrees.
+        Can be a float or a keyframe spec string.
     :param fisheye_fov_deg: Total angular FOV of the output fisheye in degrees.
     :param upright: When ``True``, the camera is kept horizontally upright and
         *lat_deg* defines the lower latitude boundary of the reprojected image.
+    :param border_size: Width in pixels of the border to add around the input
+        image on each side before reprojection.  0 means no border.
+    :param border_color: Hex colour string for the border (e.g. ``"ffffff"``).
     """
     src_img = cv2.imread(str(input_path), cv2.IMREAD_UNCHANGED)
     if src_img is None:
         raise FileNotFoundError(f"Failed to read image: {input_path}")
+    if border_size > 0:
+        src_img = add_border(src_img, border_size, border_color)
     logger.info(
         "Processing image %s (%dx%d) …", input_path, src_img.shape[1], src_img.shape[0]
     )
     result = reproject_rectilinear_to_fisheye(
-        src_img, output_size, lat_deg, lon_deg, hfov_deg, fisheye_fov_deg, upright
+        src_img,
+        output_size,
+        resolve_keyframable(lat_deg, 0, 1),
+        resolve_keyframable(lon_deg, 0, 1),
+        resolve_keyframable(hfov_deg, 0, 1),
+        fisheye_fov_deg,
+        upright,
     )
     cv2.imwrite(str(output_path), result)
     logger.info("Output written to %s", output_path)
@@ -405,13 +560,15 @@ def process_image(
 def process_video(
     input_path: Path,
     output_path: Path,
-    output_size: int = 2048,
-    lat_deg: float = 90.0,
-    lon_deg: float = 0.0,
-    hfov_deg: float = 90.0,
+    output_size: int = 4096,
+    lat_deg: "float | str" = 90.0,
+    lon_deg: "float | str" = 0.0,
+    hfov_deg: "float | str" = 90.0,
     fisheye_fov_deg: float = 180.0,
     upright: bool = False,
     work_dir: Path | None = None,
+    border_size: int = 0,
+    border_color: str = "ffffff",
 ) -> None:
     """Convert every frame of a video to an equidistant fisheye dome master.
 
@@ -428,12 +585,18 @@ def process_video(
     :param output_path: Destination video file.
     :param output_size: Side length of the (square) output frames in pixels.
     :param lat_deg: Latitude of the camera's optical axis (90 ° = zenith).
+        Can be a float or a keyframe spec string ``"K:f,l,ival,eval,T"``.
     :param lon_deg: Longitude of the camera's optical axis (0 ° = bottom).
+        Can be a float or a keyframe spec string.
     :param hfov_deg: Horizontal field of view of the source frames in degrees.
+        Can be a float or a keyframe spec string.
     :param fisheye_fov_deg: Total angular FOV of the output fisheye in degrees.
     :param upright: When ``True``, the camera is kept horizontally upright and
         *lat_deg* defines the lower latitude boundary of the reprojected frames.
     :param work_dir: Optional directory for intermediate files.
+    :param border_size: Width in pixels of the border to add around each input
+        frame on each side before reprojection.  0 means no border.
+    :param border_color: Hex colour string for the border (e.g. ``"ffffff"``).
     """
     managed = work_dir is None
     if managed:
@@ -449,16 +612,25 @@ def process_video(
         if not frame_files:
             raise FileNotFoundError(f"No frames were extracted from {input_path}")
 
-        logger.info("Processing %d frame(s) …", len(frame_files))
+        total_frames = len(frame_files)
+        logger.info("Processing %d frame(s) …", total_frames)
         for idx, frame_path in enumerate(frame_files):
             logger.info(
-                "  Frame %d/%d: %s", idx + 1, len(frame_files), frame_path.name
+                "  Frame %d/%d: %s", idx + 1, total_frames, frame_path.name
             )
             src_img = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
             if src_img is None:
                 raise FileNotFoundError(f"Failed to read frame: {frame_path}")
+            if border_size > 0:
+                src_img = add_border(src_img, border_size, border_color)
             result = reproject_rectilinear_to_fisheye(
-                src_img, output_size, lat_deg, lon_deg, hfov_deg, fisheye_fov_deg, upright
+                src_img,
+                output_size,
+                resolve_keyframable(lat_deg, idx, total_frames),
+                resolve_keyframable(lon_deg, idx, total_frames),
+                resolve_keyframable(hfov_deg, idx, total_frames),
+                fisheye_fov_deg,
+                upright,
             )
             cv2.imwrite(str(processed_dir / f"out_{idx:06d}.tif"), result)
 
@@ -472,6 +644,25 @@ def process_video(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _keyframable_float(value: str) -> "float | str":
+    """argparse type that accepts either a plain float or a keyframe spec string.
+
+    A plain numeric string is converted to :class:`float`.  A string starting
+    with ``"K:"`` is returned as-is (it will be parsed at processing time via
+    :func:`parse_keyframe_spec`).
+    """
+    try:
+        return float(value)
+    except ValueError:
+        if value.startswith("K:"):
+            # Eagerly validate the spec so the user gets an immediate error.
+            parse_keyframe_spec(value)
+            return value
+        raise argparse.ArgumentTypeError(
+            f"Expected a number or a keyframe spec (K:f,l,ival,eval,T), got {value!r}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -497,30 +688,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-size",
         type=int,
-        default=2048,
+        default=4096,
         metavar="PIXELS",
         help="Side length of the square output image/frame in pixels.",
     )
     parser.add_argument(
         "--lat",
-        type=float,
+        type=_keyframable_float,
         default=90.0,
         metavar="DEGREES",
-        help="Latitude of the camera's optical axis in degrees (90 = zenith).",
+        help=(
+            "Latitude of the camera's optical axis in degrees (90 = zenith). "
+            "Accepts a plain number or a keyframe spec K:f,l,ival,eval,T."
+        ),
     )
     parser.add_argument(
         "--lon",
-        type=float,
+        type=_keyframable_float,
         default=0.0,
         metavar="DEGREES",
-        help="Longitude of the camera's optical axis in degrees (0 = bottom of dome).",
+        help=(
+            "Longitude of the camera's optical axis in degrees (0 = bottom of dome). "
+            "Accepts a plain number or a keyframe spec K:f,l,ival,eval,T."
+        ),
     )
     parser.add_argument(
         "--hfov",
-        type=float,
+        type=_keyframable_float,
         default=90.0,
         metavar="DEGREES",
-        help="Horizontal field of view of the input image in degrees.",
+        help=(
+            "Horizontal field of view of the input image in degrees. "
+            "Accepts a plain number or a keyframe spec K:f,l,ival,eval,T."
+        ),
     )
     parser.add_argument(
         "--output-fov",
@@ -528,6 +728,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=180.0,
         metavar="DEGREES",
         help="Total angular field of view of the output fisheye image in degrees.",
+    )
+    parser.add_argument(
+        "--border-size",
+        type=int,
+        default=0,
+        metavar="PIXELS",
+        help=(
+            "Width in pixels of a solid-colour border to add around each input "
+            "frame on all sides before reprojection.  0 means no border."
+        ),
+    )
+    parser.add_argument(
+        "--border-color",
+        default="ffffff",
+        metavar="RRGGBB",
+        help="Hex colour code (without #) for the border, e.g. 'ffffff' for white.",
     )
     parser.add_argument(
         "--upright",
@@ -604,6 +820,8 @@ def main(argv: list[str] | None = None) -> int:
         hfov_deg=args.hfov,
         fisheye_fov_deg=args.output_fov,
         upright=args.upright,
+        border_size=args.border_size,
+        border_color=args.border_color,
     )
 
     try:

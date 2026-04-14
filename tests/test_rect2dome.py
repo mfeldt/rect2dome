@@ -17,6 +17,7 @@ from rect2dome import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
     _default_output_path,
+    add_border,
     build_parser,
     detect_media_type,
     encode_video,
@@ -24,9 +25,11 @@ from rect2dome import (
     get_image_dimensions,
     get_video_framerate,
     main,
+    parse_keyframe_spec,
     process_image,
     process_video,
     reproject_rectilinear_to_fisheye,
+    resolve_keyframable,
 )
 
 
@@ -197,7 +200,7 @@ class TestProcessImage:
     def test_custom_output_size(self, tmp_path):
         dst = self._run(tmp_path, output_size=64)
         out = cv2.imread(str(dst), cv2.IMREAD_UNCHANGED)
-        assert out.shape == (64, 64, 3)
+        assert out.shape == (64, 64, 4)
 
     def test_raises_for_unreadable_image(self, tmp_path):
         src = tmp_path / "empty.tif"
@@ -276,7 +279,7 @@ class TestBuildParser:
     def test_defaults(self):
         parser = build_parser()
         args = parser.parse_args(["input.mp4"])
-        assert args.output_size == 2048
+        assert args.output_size == 4096
         assert args.lat == 90.0
         assert args.lon == 0.0
         assert args.hfov == 90.0
@@ -284,6 +287,8 @@ class TestBuildParser:
         assert not args.upright
         assert not args.keep_frames
         assert not args.verbose
+        assert args.border_size == 0
+        assert args.border_color == "ffffff"
 
     def test_explicit_output(self):
         parser = build_parser()
@@ -360,7 +365,7 @@ class TestReprojectRectilinearToFisheye:
     def test_output_shape_square(self):
         src = self._solid_image()
         out = reproject_rectilinear_to_fisheye(src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=90.0)
-        assert out.shape == (256, 256, 3)
+        assert out.shape == (256, 256, 4)
 
     def test_output_dtype_preserved(self):
         src = self._solid_image().astype(np.float32)
@@ -468,7 +473,7 @@ class TestReprojectRectilinearToFisheye:
         out = reproject_rectilinear_to_fisheye(
             src, 256, lat_deg=0.0, lon_deg=0.0, hfov_deg=90.0, upright=True
         )
-        assert out.shape == (256, 256, 3)
+        assert out.shape == (256, 256, 4)
 
     def test_upright_differs_from_tangential(self):
         """upright=True and upright=False should produce different images for the
@@ -521,3 +526,241 @@ class TestReprojectRectilinearToFisheye:
             src, 128, lat_deg=30.0, lon_deg=0.0, hfov_deg=60.0, upright=False
         )
         np.testing.assert_array_equal(out_default, out_explicit)
+
+    # ------------------------------------------------------------------
+    # Alpha-channel / transparency
+    # ------------------------------------------------------------------
+
+    def test_3channel_input_yields_4channel_output(self):
+        """A BGR source image must produce a BGRA output (4-channel)."""
+        src = self._solid_image(channels=3)
+        out = reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        assert out.ndim == 3 and out.shape[2] == 4
+
+    def test_transparent_background(self):
+        """Pixels outside the valid projection region must have alpha = 0."""
+        src = self._solid_image(channels=3, value=255)
+        out = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=5.0
+        )
+        # Corners are always outside the fisheye circle for a tiny HFOV.
+        for corner in [(0, 0), (0, 255), (255, 0), (255, 255)]:
+            assert out[corner][3] == 0, f"corner {corner} should be fully transparent"
+
+    def test_valid_pixels_are_opaque(self):
+        """The centre pixel (projected from source) must have alpha = 255."""
+        src = self._solid_image(channels=3, value=200)
+        out = reproject_rectilinear_to_fisheye(
+            src, 256, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        assert out[128, 128, 3] == 255, "Centre pixel should be fully opaque"
+
+    def test_4channel_input_unchanged_channels(self):
+        """A 4-channel input must pass through without gaining an extra channel."""
+        src = np.full((32, 64, 4), 200, dtype=np.uint8)
+        out = reproject_rectilinear_to_fisheye(
+            src, 64, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        assert out.shape == (64, 64, 4)
+
+    def test_grayscale_input_unchanged_shape(self):
+        """A grayscale (2-D) input must not have an alpha channel added."""
+        src = np.full((480, 640), 128, dtype=np.uint8)
+        out = reproject_rectilinear_to_fisheye(
+            src, 128, lat_deg=90.0, lon_deg=0.0, hfov_deg=60.0
+        )
+        assert out.ndim == 2
+
+
+# ---------------------------------------------------------------------------
+# add_border
+# ---------------------------------------------------------------------------
+
+
+class TestAddBorder:
+    def test_no_border_returns_same_array(self):
+        img = np.zeros((10, 10, 3), dtype=np.uint8)
+        out = add_border(img, 0)
+        assert out is img
+
+    def test_negative_border_returns_same_array(self):
+        img = np.zeros((10, 10, 3), dtype=np.uint8)
+        out = add_border(img, -5)
+        assert out is img
+
+    def test_border_increases_size(self):
+        img = np.zeros((10, 20, 3), dtype=np.uint8)
+        out = add_border(img, 5)
+        assert out.shape == (20, 30, 3)
+
+    def test_white_border_color(self):
+        img = np.zeros((4, 4, 3), dtype=np.uint8)
+        out = add_border(img, 1, "ffffff")
+        # Top-left corner pixel should be white (BGR: 255, 255, 255).
+        assert np.all(out[0, 0] == 255)
+
+    def test_custom_border_color(self):
+        img = np.zeros((4, 4, 3), dtype=np.uint8)
+        out = add_border(img, 1, "ff0000")  # pure red in RGB → BGR = (0, 0, 255)
+        assert out[0, 0, 0] == 0    # B
+        assert out[0, 0, 1] == 0    # G
+        assert out[0, 0, 2] == 255  # R
+
+    def test_border_color_with_hash_prefix(self):
+        img = np.zeros((4, 4, 3), dtype=np.uint8)
+        out = add_border(img, 1, "#ffffff")
+        assert np.all(out[0, 0] == 255)
+
+    def test_border_preserves_inner_content(self):
+        img = np.full((4, 4, 3), 42, dtype=np.uint8)
+        out = add_border(img, 2, "000000")
+        # Inner region (rows 2:6, cols 2:6) should still be 42.
+        assert np.all(out[2:6, 2:6] == 42)
+
+    def test_border_bgra_image_gets_opaque_alpha(self):
+        img = np.zeros((4, 4, 4), dtype=np.uint8)
+        out = add_border(img, 1, "ffffff")
+        # Alpha channel of the border should be 255 (opaque).
+        assert out[0, 0, 3] == 255
+
+    def test_border_grayscale_image(self):
+        img = np.zeros((4, 4), dtype=np.uint8)
+        out = add_border(img, 1, "808080")
+        assert out.shape == (6, 6)
+        # Approximate luminance of #808080: round(0.299*128 + 0.587*128 + 0.114*128) = 128
+        assert out[0, 0] == int(0.299 * 128 + 0.587 * 128 + 0.114 * 128)
+
+
+# ---------------------------------------------------------------------------
+# parse_keyframe_spec
+# ---------------------------------------------------------------------------
+
+
+class TestParseKeyframeSpec:
+    def test_valid_linear(self):
+        spec = parse_keyframe_spec("K:0,10,45.0,90.0,L")
+        assert spec["f"] == 0
+        assert spec["l"] == 10
+        assert spec["ival"] == pytest.approx(45.0)
+        assert spec["eval"] == pytest.approx(90.0)
+        assert spec["interp"] == "L"
+
+    def test_valid_sinusoidal(self):
+        spec = parse_keyframe_spec("K:5,-1,10.0,80.0,S")
+        assert spec["f"] == 5
+        assert spec["l"] == -1
+        assert spec["interp"] == "S"
+
+    def test_missing_k_prefix_raises(self):
+        with pytest.raises(ValueError, match="must start with"):
+            parse_keyframe_spec("5,10,45,90,L")
+
+    def test_wrong_field_count_raises(self):
+        with pytest.raises(ValueError, match="5 comma-separated fields"):
+            parse_keyframe_spec("K:0,10,45,90")
+
+    def test_invalid_interp_type_raises(self):
+        with pytest.raises(ValueError, match="Interpolation type"):
+            parse_keyframe_spec("K:0,10,45.0,90.0,X")
+
+
+# ---------------------------------------------------------------------------
+# resolve_keyframable
+# ---------------------------------------------------------------------------
+
+
+class TestResolveKeyframable:
+    def test_float_passthrough(self):
+        assert resolve_keyframable(45.0, 5, 10) == pytest.approx(45.0)
+
+    def test_int_passthrough(self):
+        assert resolve_keyframable(90, 0, 1) == pytest.approx(90.0)
+
+    def test_before_keyframe_range_returns_ival(self):
+        # Frames 0-4 should all return ival=10.0
+        for idx in range(5):
+            assert resolve_keyframable("K:5,15,10.0,90.0,L", idx, 20) == pytest.approx(10.0)
+
+    def test_after_keyframe_range_returns_eval(self):
+        # Frames 16-19 should all return eval=90.0
+        for idx in range(16, 20):
+            assert resolve_keyframable("K:5,15,10.0,90.0,L", idx, 20) == pytest.approx(90.0)
+
+    def test_linear_midpoint(self):
+        # At frame 10 (midpoint of [5, 15]), t=0.5 → (10+90)/2 = 50
+        val = resolve_keyframable("K:5,15,10.0,90.0,L", 10, 20)
+        assert val == pytest.approx(50.0)
+
+    def test_linear_at_start(self):
+        val = resolve_keyframable("K:5,15,10.0,90.0,L", 5, 20)
+        assert val == pytest.approx(10.0)
+
+    def test_linear_at_end(self):
+        val = resolve_keyframable("K:5,15,10.0,90.0,L", 15, 20)
+        assert val == pytest.approx(90.0)
+
+    def test_sinusoidal_midpoint(self):
+        import math
+        # At midpoint t=0.5: s = 0.5*(1 - cos(π*0.5)) = 0.5*(1-0) = 0.5 → 50.0
+        val = resolve_keyframable("K:5,15,10.0,90.0,S", 10, 20)
+        assert val == pytest.approx(50.0)
+
+    def test_negative_l_resolves_to_last_frame(self):
+        # l=-1 with total_frames=20 → l=19; frame 19 should return eval
+        val = resolve_keyframable("K:5,-1,10.0,90.0,L", 19, 20)
+        assert val == pytest.approx(90.0)
+
+    def test_negative_l_mid_interpolation(self):
+        # l=-1 with total_frames=20 → l=19; frame 12 (midpoint of [5,19]) → t=0.5
+        val = resolve_keyframable("K:5,-1,10.0,90.0,L", 12, 20)
+        assert val == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------------------
+# CLI: border and keyframable params
+# ---------------------------------------------------------------------------
+
+
+class TestBuildParserNewArgs:
+    def test_border_size_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg"])
+        assert args.border_size == 0
+
+    def test_border_size_override(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg", "--border-size", "20"])
+        assert args.border_size == 20
+
+    def test_border_color_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg"])
+        assert args.border_color == "ffffff"
+
+    def test_border_color_override(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg", "--border-color", "000000"])
+        assert args.border_color == "000000"
+
+    def test_lat_accepts_float(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg", "--lat", "45.0"])
+        assert args.lat == pytest.approx(45.0)
+
+    def test_lat_accepts_keyframe_spec(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg", "--lat", "K:0,10,45.0,90.0,L"])
+        assert args.lat == "K:0,10,45.0,90.0,L"
+
+    def test_lon_accepts_keyframe_spec(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg", "--lon", "K:0,-1,0.0,180.0,S"])
+        assert args.lon == "K:0,-1,0.0,180.0,S"
+
+    def test_hfov_accepts_keyframe_spec(self):
+        parser = build_parser()
+        args = parser.parse_args(["in.jpg", "--hfov", "K:5,15,60.0,120.0,L"])
+        assert args.hfov == "K:5,15,60.0,120.0,L"
+
