@@ -629,8 +629,9 @@ class TestAddBorder:
         img = np.zeros((4, 4), dtype=np.uint8)
         out = add_border(img, 1, "808080")
         assert out.shape == (6, 6)
-        # Approximate luminance of #808080: round(0.299*128 + 0.587*128 + 0.114*128) = 128
-        assert out[0, 0] == int(0.299 * 128 + 0.587 * 128 + 0.114 * 128)
+        # Expected luminance: convert #808080 (BGR: 128, 128, 128) via OpenCV.
+        expected = int(cv2.cvtColor(np.array([[[128, 128, 128]]], dtype=np.uint8), cv2.COLOR_BGR2GRAY)[0, 0])
+        assert out[0, 0] == expected
 
 
 # ---------------------------------------------------------------------------

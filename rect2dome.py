@@ -196,7 +196,9 @@ def add_border(img: "np.ndarray", border_size: int, border_color: str = "ffffff"
     if img.ndim == 3:
         color: int | tuple = (b, g, r, 255) if img.shape[2] == 4 else (b, g, r)
     else:
-        color = int(0.299 * r + 0.587 * g + 0.114 * b)
+        # Convert to grayscale using OpenCV's own coefficients for consistency.
+        bgr_pixel = np.array([[[b, g, r]]], dtype=np.uint8)
+        color = int(cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2GRAY)[0, 0])
     return cv2.copyMakeBorder(
         img,
         border_size, border_size, border_size, border_size,
@@ -276,6 +278,8 @@ def resolve_keyframable(param: "float | str", frame_idx: int, total_frames: int)
     interp: str = spec["interp"]
 
     if l < 0:
+        # Resolve negative frame indices using Python-style negative indexing:
+        # -1 → last frame (total_frames - 1), -2 → second-to-last, etc.
         l = total_frames + l
 
     if frame_idx < f:
